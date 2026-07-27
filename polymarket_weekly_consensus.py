@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +19,10 @@ from typing import Any
 DEFAULT_TOP_TRADERS = 20
 DEFAULT_MIN_TRADERS_PER_POSITION = 3
 DEFAULT_MAX_DEVIATION = 0.10
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; polymarket-consensus-script/1.0; +https://github.com/bhdeitz124/bhdeitz2)"
+DEFAULT_RETRIES = 4
+DEFAULT_RETRY_BACKOFF = 0.75
+DEFAULT_REQUEST_DELAY = 0.0
 
 
 @dataclass(frozen=True)
@@ -33,10 +39,47 @@ class Position:
     average_price_paid: float
 
 
-def _http_get_json(url: str, timeout: int) -> Any:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _http_get_json(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    retries: int,
+    retry_backoff: float,
+    request_delay: float,
+) -> Any:
+    if request_delay > 0:
+        time.sleep(request_delay)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": user_agent,
+        },
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # Retry only for likely-transient or anti-bot/rate-limit statuses.
+            if exc.code not in {403, 408, 425, 429, 500, 502, 503, 504} or attempt >= retries:
+                raise
+            last_exc = exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if attempt >= retries:
+                raise
+            last_exc = exc
+
+        # Exponential backoff + small jitter.
+        sleep_s = retry_backoff * (2**attempt) + random.uniform(0, 0.25)
+        time.sleep(sleep_s)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unexpected HTTP retry state")
 
 
 def _first_list(payload: Any, candidates: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -161,7 +204,15 @@ def extract_open_positions(payload: Any) -> list[Position]:
     return positions
 
 
-def _fetch_top_traders(base_url: str, limit: int, timeout: int) -> list[Trader]:
+def _fetch_top_traders(
+    base_url: str,
+    limit: int,
+    timeout: int,
+    user_agent: str,
+    retries: int,
+    retry_backoff: float,
+    request_delay: float,
+) -> list[Trader]:
     routes = [
         "/leaderboard/sports/weekly/profit",
         f"/leaderboard/sports/weekly/profit?limit={limit}",
@@ -172,7 +223,14 @@ def _fetch_top_traders(base_url: str, limit: int, timeout: int) -> list[Trader]:
     for route in routes:
         url = urllib.parse.urljoin(base_url, route)
         try:
-            payload = _http_get_json(url, timeout=timeout)
+            payload = _http_get_json(
+                url,
+                timeout=timeout,
+                user_agent=user_agent,
+                retries=retries,
+                retry_backoff=retry_backoff,
+                request_delay=request_delay,
+            )
             traders = extract_top_traders(payload, limit)
             if traders:
                 return traders
@@ -183,7 +241,15 @@ def _fetch_top_traders(base_url: str, limit: int, timeout: int) -> list[Trader]:
     raise RuntimeError(f"Unable to fetch top traders. Attempts:\n{joined}")
 
 
-def _fetch_open_positions_for_trader(base_url: str, trader: Trader, timeout: int) -> list[Position]:
+def _fetch_open_positions_for_trader(
+    base_url: str,
+    trader: Trader,
+    timeout: int,
+    user_agent: str,
+    retries: int,
+    retry_backoff: float,
+    request_delay: float,
+) -> list[Position]:
     encoded_address = urllib.parse.quote(trader.address)
     routes = [
         f"/positions?user={encoded_address}&openOnly=true",
@@ -196,7 +262,14 @@ def _fetch_open_positions_for_trader(base_url: str, trader: Trader, timeout: int
     for route in routes:
         url = urllib.parse.urljoin(base_url, route)
         try:
-            payload = _http_get_json(url, timeout=timeout)
+            payload = _http_get_json(
+                url,
+                timeout=timeout,
+                user_agent=user_agent,
+                retries=retries,
+                retry_backoff=retry_backoff,
+                request_delay=request_delay,
+            )
             positions = extract_open_positions(payload)
             if positions:
                 return positions
@@ -270,12 +343,32 @@ def run(
     min_traders: int,
     max_deviation: float,
     timeout: int,
+    user_agent: str,
+    retries: int,
+    retry_backoff: float,
+    request_delay: float,
 ) -> list[dict[str, Any]]:
-    traders = _fetch_top_traders(data_api_base, limit=top_traders, timeout=timeout)
+    traders = _fetch_top_traders(
+        data_api_base,
+        limit=top_traders,
+        timeout=timeout,
+        user_agent=user_agent,
+        retries=retries,
+        retry_backoff=retry_backoff,
+        request_delay=request_delay,
+    )
 
     positions_by_trader: dict[str, list[Position]] = {}
     for trader in traders:
-        positions_by_trader[trader.address] = _fetch_open_positions_for_trader(data_api_base, trader, timeout=timeout)
+        positions_by_trader[trader.address] = _fetch_open_positions_for_trader(
+            data_api_base,
+            trader,
+            timeout=timeout,
+            user_agent=user_agent,
+            retries=retries,
+            retry_backoff=retry_backoff,
+            request_delay=request_delay,
+        )
 
     return find_consensus_positions(
         traders=traders,
@@ -307,6 +400,29 @@ def parse_args() -> argparse.Namespace:
         help="Maximum absolute deviation from the position's average price",
     )
     parser.add_argument("--timeout", type=int, default=15, help="HTTP timeout (seconds)")
+    parser.add_argument(
+        "--user-agent",
+        default=DEFAULT_USER_AGENT,
+        help="User-Agent header for API requests",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Number of retries for transient HTTP/network errors",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=DEFAULT_RETRY_BACKOFF,
+        help="Base retry backoff in seconds (exponential)",
+    )
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY,
+        help="Delay in seconds before each HTTP request",
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
     return parser.parse_args()
 
@@ -321,6 +437,10 @@ def main() -> int:
             min_traders=args.min_traders,
             max_deviation=args.max_deviation,
             timeout=args.timeout,
+            user_agent=args.user_agent,
+            retries=max(0, args.retries),
+            retry_backoff=max(0.0, args.retry_backoff),
+            request_delay=max(0.0, args.request_delay),
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
@@ -336,3 +456,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
